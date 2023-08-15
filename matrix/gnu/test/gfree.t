@@ -1,0 +1,491 @@
+package Geo::Coder::Free;
+ 
+# TODO: Don't have Maxmind as a separate database
+# TODO: Rename openaddresses.sql as geo_coder_free.sql
+# TODO: Consider Data::Dumper::Names instead of Data::Dumper
+ 
+use strict;
+use warnings;
+ 
+# use lib '.';
+ 
+use List::MoreUtils;
+use Carp;
+ 
+=head1 NAME
+ 
+Geo::Coder::Free - Provides a Geo-Coding functionality using free databases
+ 
+=head1 VERSION
+ 
+Version 0.32
+ 
+=cut
+ 
+our $VERSION = '0.32';
+ 
+our $alternatives;
+our $abbreviations;
+ 
+sub _abbreviate($);
+sub _normalize($);
+ 
+=head1 SYNOPSIS
+ 
+    use Geo::Coder::Free;
+ 
+    my $geo_coder = Geo::Coder::Free->new();
+    my $location = $geo_coder->geocode(location => 'Ramsgate, Kent, UK');
+ 
+    print 'Latitude: ', $location->lat(), "\n";
+    print 'Longitude: ', $location->long(), "\n";
+ 
+    # Use a local download of http://results.openaddresses.io/ and https://www.whosonfirst.org/
+    my $openaddr_geo_coder = Geo::Coder::Free->new(openaddr => $ENV{'OPENADDR_HOME'});
+    $location = $openaddr_geo_coder->geocode(location => '1600 Pennsylvania Avenue NW, Washington DC, USA');
+ 
+    print 'Latitude: ', $location->lat(), "\n";
+    print 'Longitude: ', $location->long(), "\n";
+ 
+=head1 DESCRIPTION
+ 
+Geo::Coder::Free provides an interface to free databases by acting as a front-end to
+L<Geo::Coder::Free::MaxMind> and L<Geo::Coder::Free::OpenAddresses>.
+ 
+The cgi-bin directory contains a simple DIY Geo-Coding website.
+ 
+    cgi-bin/page.fcgi page=query q=1600+Pennsylvania+Avenue+NW+Washington+DC+USA
+ 
+You can see a sample website at L<https://geocode.nigelhorne.com/>.
+ 
+    curl 'https://geocode.nigelhorne.com/cgi-bin/page.fcgi?page=query&q=1600+Pennsylvania+Avenue+NW+Washington+DC+USA'
+ 
+=head1 METHODS
+ 
+=head2 new
+ 
+    $geo_coder = Geo::Coder::Free->new();
+ 
+Takes one optional parameter, openaddr, which is the base directory of
+the OpenAddresses data downloaded from L<http://results.openaddresses.io>.
+ 
+The database also will include data from Who's On First
+L<https://whosonfirst.org>.
+ 
+Takes one optional parameter, directory,
+which tells the object where to find the MaxMind and GeoNames files admin1db,
+admin2.db and cities.[sql|csv.gz].
+If that parameter isn't given,
+the module will attempt to find the databases,
+but that can't be guaranteed.
+ 
+=cut
+ 
+sub new {
+        my($proto, %args) = @_;
+        my $class = ref($proto) || $proto;
+ 
+        if(!defined($class)) {
+                # Using Geo::Coder::Free->new not Geo::Coder::Free::new
+                # carp(__PACKAGE__, ' use ->new() not ::new() to instantiate');
+                # return;
+ 
+                # FIXME: this only works when no arguments are given
+                $class = __PACKAGE__;
+        } elsif(ref($class)) {
+                # clone the given object
+                return bless { %{$class}, %args }, ref($class);
+        }
+ 
+        if(!$alternatives) {
+                my $keep = $/;
+                local $/ = undef;
+                my $data = <DATA>;
+                $/ = $keep;
+ 
+                $alternatives = Config::Auto->new(source => $data)->parse();
+                while(my ($key, $value) = (each %{$alternatives})) {
+                        $alternatives->{$key} = join(', ', @{$value});
+                }
+        }
+        my $rc = {
+                maxmind => Geo::Coder::Free::MaxMind->new(%args),
+                alternatives => $alternatives
+        };
+ 
+        if((!$args{'openaddr'}) && $ENV{'OPENADDR_HOME'}) {
+                $args{'openaddr'} = $ENV{'OPENADDR_HOME'};
+        }
+ 
+        if($args{'openaddr'}) {
+                $rc->{'openaddr'} = Geo::Coder::Free::OpenAddresses->new(%args);
+        }
+        if(my $cache = $args{'cache'}) {
+                $rc->{'cache'} = $cache;
+        }
+ 
+        return bless $rc, $class;
+}
+ 
+=head2 geocode
+ 
+    $location = $geo_coder->geocode(location => $location);
+ 
+    print 'Latitude: ', $location->{'latitude'}, "\n";
+    print 'Longitude: ', $location->{'longitude'}, "\n";
+ 
+    # TODO:
+    # @locations = $geo_coder->geocode('Portland, USA');
+    # diag 'There are Portlands in ', join (', ', map { $_->{'state'} } @locations);
+ 
+    # Note that this yields many false positives and isn't useable yet
+    my @matches = $geo_coder->geocode(scantext => 'arbitrary text', region => 'US');
+ 
+=cut
+ 
+my %common_words = (
+        'the' => 1,
+        'and' => 1,
+        'at' => 1,
+        'be' => 1,
+        'by' => 1,
+        'she' => 1,
+        'of' => 1,
+        'for' => 1,
+        'on' => 1,
+        'pm' => 1,
+        'in' => 1,
+        'an' => 1,
+        'to' => 1,
+        'road' => 1,
+        'is' => 1,
+        'was' => 1
+);
+ 
+sub geocode {
+        my $self = shift;
+        my %param;
+ 
+        if(ref($_[0]) eq 'HASH') {
+                %param = %{$_[0]};
+        } elsif(ref($_[0])) {
+                Carp::croak('Usage: geocode(location => $location|scantext => $text)');
+        } elsif(@_ % 2 == 0) {
+                %param = @_;
+        } else {
+                $param{'location'} = shift;
+        }
+ 
+        if($self->{'openaddr'}) {
+                if(wantarray) {
+                        my @rc = $self->{'openaddr'}->geocode(\%param);
+                        if((my $scantext = $param{'scantext'}) && (my $region = $param{'region'})) {
+                                $scantext =~ s/\W+/ /g;
+                                foreach my $word(List::MoreUtils::uniq(split(/\s/, $scantext))) {
+                                        # FIXME:  There are a *lot* of false positives
+                                        next if(exists($common_words{lc$word}));
+                                        if($word =~ /^[a-z]{2,}$/i) {
+                                                my $key = "$word/$region";
+                                                my @matches;
+                                                if($self->{'scantext'}->{$key}) {
+                                                        # ::diag("$key: HIT");
+                                                        @matches = @{$self->{'scantext'}->{$key}};
+                                                } else {
+                                                        # ::diag("$key: MISS");
+                                                        @matches = $self->{'maxmind'}->geocode({ location => $word, region => $region });
+                                                }
+                                                $self->{'scantext'}->{$key} = \@matches;
+                                                @rc = (@rc, @matches);
+                                        }
+ 
+                                }
+                        }
+                        return @rc if(scalar(@rc) && $rc[0]);
+                } elsif(my $rc = $self->{'openaddr'}->geocode(\%param)) {
+                        return $rc;
+                }
+                if((!$param{'scantext'}) && (my $alternatives = $self->{'alternatives'})) {
+                        # Try some alternatives, would be nice to read this from somewhere on line
+                        my $location = $param{'location'};
+                        while (my($key, $value) = each %{$alternatives}) {
+                                if($location =~ $key) {
+                                        # ::diag("$key=>$value");
+                                        my $keep = $location;
+                                        $location =~ s/$key/$value/;
+                                        $param{'location'} = $location;
+                                        if(my $rc = $self->geocode(\%param)) {
+                                                return $rc;
+                                        }
+                                        # Try without the commas, for "Tyne and Wear"
+                                        if($value =~ /, /) {
+                                                my $string = $value;
+                                                $string =~ s/,//g;
+                                                $location = $keep;
+                                                $location =~ s/$key/$string/;
+                                                $param{'location'} = $location;
+                                                if(my $rc = $self->geocode(\%param)) {
+                                                        return $rc;
+                                                }
+                                        }
+                                }
+                        }
+                }
+        }
+ 
+        # FIXME:  scantext only works if OPENADDR_HOME is set
+        if($param{'location'}) {
+                if(wantarray) {
+                        my @rc = $self->{'maxmind'}->geocode(\%param);
+                        return @rc;
+                }
+                return $self->{'maxmind'}->geocode(\%param);
+        }
+        if(!$param{'scantext'}) {
+                Carp::croak('Usage: geocode(location => $location|scantext => $text)');
+        }
+}
+ 
+=head2 reverse_geocode
+ 
+    $location = $geocoder->reverse_geocode(latlng => '37.778907,-122.39732');
+ 
+To be done.
+ 
+=cut
+ 
+sub reverse_geocode {
+        my $self = shift;
+        my %param;
+ 
+        if(ref($_[0]) eq 'HASH') {
+                %param = %{$_[0]};
+        } elsif(ref($_[0])) {
+                Carp::croak('Usage: geocode(location => $location|scantext => $text)');
+        } elsif(scalar(@_) % 2 == 0) {
+                %param = @_;
+        } elsif(scalar(@_) == 1) {
+                $param{location} = shift;
+        } else {
+                Carp::croak('Usage: geocode(location => $location|scantext => $text)');
+        }
+ 
+        # The drivers don't yet support it
+        if($self->{'openaddr'}) {
+                if(wantarray) {
+                        my @rc = $self->{'openaddr'}->geocode(\%param);
+                        return @rc;
+                } elsif(my $rc = $self->{'openaddr'}->geocode(\%param)) {
+                        return $rc;
+                }
+        }
+ 
+        if($param{'location'}) {
+                if(wantarray) {
+                        my @rc = $self->{'maxmind'}->geocode(\%param);
+                        return @rc;
+                }
+                return $self->{'maxmind'}->geocode(\%param);
+        }
+ 
+        Carp::croak('Reverse lookup is not yet supported');
+}
+ 
+=head2  ua
+ 
+Does nothing, here for compatibility with other Geo-Coders
+ 
+=cut
+ 
+sub ua {
+}
+ 
+=head2 run
+ 
+You can also run this module from the command line:
+ 
+    perl lib/Geo/Coder/Free.pm 1600 Pennsylvania Avenue NW, Washington DC
+ 
+=cut
+ 
+__PACKAGE__->run(@ARGV) unless caller();
+ 
+sub run {
+        require Data::Dumper;
+ 
+        my $class = shift;
+ 
+        my $location = join(' ', @_);
+ 
+        my @rc;
+        if($ENV{'OPENADDR_HOME'}) {
+                @rc = $class->new(directory => $ENV{'OPENADDR_HOME'})->geocode($location);
+        } else {
+                @rc = $class->new()->geocode($location);
+        }
+ 
+        die "$0: geocoding failed" unless(scalar(@rc));
+ 
+        print Data::Dumper->new([\@rc])->Dump();
+}
+ 
+sub _normalize($) {
+        my $street = shift;
+ 
+        $abbreviations ||= Geo::Coder::Abbreviations->new();
+ 
+        $street = uc($street);
+        if($street =~ /(.+)\s+(.+)\s+(.+)/) {
+                my $a;
+                if((lc($2) ne 'cross') && ($a = $abbreviations->abbreviate($2))) {
+                        $street = "$1 $a $3";
+                } elsif($a = $abbreviations->abbreviate($3)) {
+                        $street = "$1 $2 $a";
+                }
+        } elsif($street =~ /(.+)\s(.+)$/) {
+                if(my $a = $abbreviations->abbreviate($2)) {
+                        $street = "$1 $a";
+                }
+        }
+        $street =~ s/^0+//;     # Turn 04th St into 4th St
+        return $street;
+}
+ 
+sub _abbreviate($) {
+        my $type = uc(shift);
+ 
+        $abbreviations ||= Geo::Coder::Abbreviations->new();
+ 
+        if(my $rc = $abbreviations->abbreviate($type)) {
+                return $rc;
+        }
+        return $type;
+}
+ 
+=head1 AUTHOR
+ 
+Nigel Horne, C<< <njh@bandsman.co.uk> >>
+ 
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself.
+ 
+=head1 GETTING STARTED
+ 
+Before you start,
+install L<App::csv2sqlite>;
+optionally set the environment variable OPENADDR_HOME to point to an empty directory and download the data from L<http://results.openaddresses.io> into that directory;
+optionally set the environment variable WHOSONFIRST_HOME to point to an empty directory and download the data using L<https://github.com/nigelhorne/NJH-Snippets/blob/master/bin/wof-sqlite-download>.
+You do not need to download the MaxMind data, that will be downloaded automatically.
+ 
+=head1 MORE INFORMATION
+ 
+I've written a few Perl related Genealogy programs including gedcom (L<https://github.com/nigelhorne/gedcom>)
+and ged2site (L<https://github.com/nigelhorne/ged2site>).
+One of the things that these do is to check the validity of your family tree, and one of those tasks is to verify place-names.
+Of course places do change names and spelling becomes more consistent over the years, but the vast majority remain the same.
+Enough of a majority to computerise the verification.
+Unfortunately all of the on-line services have one problem or another - most either charge for large number of access, or throttle the number of look-ups.
+Even my modest tree, just over 2000 people, reaches those limits.
+ 
+There are, however, a number of free databases that can be used, including MaxMind, GeoNames, OpenAddresses and WhosOnFirst.
+The objective of Geo::Coder::Free (L<https://github.com/nigelhorne/Geo-Coder-Free>)
+is to create a database of those databases and to create a search engine either through a local copy of the database or through an on-line website.
+Both are in their early days, but I have examples which do surprisingly well.
+ 
+The local copy of the database is built using the createdatabase.PL script which is bundled with G:C:F.
+That script creates a single SQLite file from downloaded copies of the databases listed above, to create the database you will need
+to first install L<App::csv2sqlite>.
+If REDIS_SERVER is set, the data are also stored on a Redis Server.
+Running 'make' will download GeoNames and MaxMind, but OpenAddresses and WhosOnFirst need to be downloaded manually if you decide to use them - they are treated as optional by G:C:F.
+ 
+There is a sample website at L<https://geocode.nigelhorne.com/>.  The source code for that site is included in the G:C:F distribution.
+ 
+=head1 BUGS
+ 
+Some lookups fail at the moments, if you find one please file a bug report.
+ 
+Doesn't include results from
+L<Geo::Coder::Free::Local>.
+ 
+The MaxMind data only contains cities.
+The OpenAddresses data doesn't cover the globe.
+ 
+Can't parse and handle "London, England".
+ 
+=head1 SEE ALSO
+ 
+L<https://openaddresses.io/>,
+L<https://www.maxmind.com/en/home>,
+L<https://www.geonames.org/>,
+L<https://raw.githubusercontent.com/dr5hn/countries-states-cities-database/master/countries%2Bstates%2Bcities.json>,
+L<https://www.whosonfirst.org/> and
+L<https://github.com/nigelhorne/vwf>.
+ 
+L<Geo::Coder::Free::Local>,
+L<Geo::Coder::Free::Maxmind>,
+L<Geo::Coder::Free::OpenAddresses>.
+ 
+See L<Geo::Coder::Free::OpenAddresses> for instructions creating the SQLite database from
+L<http://results.openaddresses.io/>.
+ 
+=head1 SUPPORT
+ 
+You can find documentation for this module with the perldoc command.
+ 
+    perldoc Geo::Coder::Free
+ 
+You can also look for information at:
+ 
+=over 4
+ 
+=item * MetaCPAN
+ 
+L<https://metacpan.org/release/Geo-Coder-Free>
+ 
+=item * RT: CPAN's request tracker
+ 
+L<https://rt.cpan.org/NoAuth/Bugs.html?Dist=Geo-Coder-Free>
+ 
+=item * CPANTS
+ 
+L<http://cpants.cpanauthors.org/dist/Geo-Coder-Free>
+ 
+=item * CPAN Testers' Matrix
+ 
+L<http://matrix.cpantesters.org/?dist=Geo-Coder-Free>
+ 
+=item * CPAN Testers Dependencies
+ 
+L<http://deps.cpantesters.org/?module=Geo::Coder::Free>
+ 
+=item * Search CPAN
+ 
+L<http://search.cpan.org/dist/Geo-Coder-Free/>
+ 
+=back
+ 
+=head1 LICENSE AND COPYRIGHT
+ 
+Copyright 2017-2023 Nigel Horne.
+ 
+The program code is released under the following licence: GPL for personal use on a single computer.
+All other users (including Commercial, Charity, Educational, Government)
+must apply in writing for a licence for use from Nigel Horne at `<njh at nigelhorne.com>`.
+ 
+This product uses GeoLite2 data created by MaxMind, available from
+L<https://www.maxmind.com/en/home>. See their website for licensing information.
+ 
+This product uses data from Who's on First.
+See L<https://github.com/whosonfirst-data/whosonfirst-data/blob/master/LICENSE.md> for licensing information.
+ 
+=cut
+ 
+1;
+ 
+# Common mappings allowing looser lookups
+# Would be nice to read this from somewhere on-line
+# See also lib/Geo/Coder/Free/Local.pm
+__DATA__
+St Lawrence, Thanet, Kent = Ramsgate, Kent
+St Peters, Thanet, Kent = Broadstairs, Kent
+Minster, Thanet, Kent = Ramsgate, Kent
+Tyne and Wear = Borough of North Tyneside
